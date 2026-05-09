@@ -125,7 +125,7 @@ The following assessments were retrieved as potentially relevant to this convers
 
 
 def build_system_prompt(catalog_results: list[dict]) -> str:
-   if not catalog_results:
+    if not catalog_results:
         catalog_context = "No assessments retrieved. Ask the user for more details."
     else:
         lines = []
@@ -198,7 +198,7 @@ def needs_clarification(messages: list[dict]) -> bool:
 
     return False
 
-def 
+def parse_llm_response(raw: str) -> dict:
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
@@ -454,7 +454,7 @@ async def chat(request: ChatRequest):
             recommendations=[],
             end_of_conversation=False,
         )
-        
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
