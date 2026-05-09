@@ -1,34 +1,22 @@
-"""
-Hybrid Retrieval Layer for SHL Assessment Recommender
-
-Combines dense (semantic) search via ChromaDB + sentence-transformers
-with sparse (keyword/BM25) search via rank_bm25, then fuses the ranked
-results using Reciprocal Rank Fusion (RRF).
-
-"""
-
 import json
 import re
 import time
 import logging
+import os
 from pathlib import Path
-from typing import Optional
-
-import chromadb
-from sentence_transformers import SentenceTransformer
+import numpy as np
+from huggingface_hub import InferenceClient
 from rank_bm25 import BM25Okapi
-
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-
 CATALOG_PATH = Path(__file__).parent / "shl_catalog_clean.json"
-CHROMA_DIR = Path(__file__).parent / "chroma_db"
-COLLECTION_NAME = "shl_assessments"
-EMBEDDING_MODEL = "all-MiniLM-L6-v2"  
 DEFAULT_K = 10
-RRF_K = 60 
+RRF_K = 60
+
+HF_MODEL_ID = "sentence-transformers/all-MiniLM-L6-v2"
+HF_TOKEN = os.environ.get("HF_TOKEN", "")
 
 def build_chunk(entry: dict) -> str:
     name = entry["name"]
@@ -54,11 +42,7 @@ def tokenize(text: str) -> list[str]:
     return tokens
 
 class SHLRetriever:
-    def __init__(
-        self,
-        catalog_path: str | Path = CATALOG_PATH,
-        force_rebuild: bool = False,
-    ):
+    def __init__(self, catalog_path: str | Path = CATALOG_PATH):
         t0 = time.perf_counter()
 
         with open(catalog_path, encoding="utf-8") as f:
@@ -75,89 +59,86 @@ class SHLRetriever:
         self.bm25 = BM25Okapi(self.bm25_corpus)
         logger.info("BM25 index built")
 
-        self.model = SentenceTransformer(EMBEDDING_MODEL)
-        logger.info(f"Loaded embedding model: {EMBEDDING_MODEL}")
-
-        self.chroma_client = chromadb.PersistentClient(path=str(CHROMA_DIR))
-
-        existing_collections = [c.name for c in self.chroma_client.list_collections()]
-        needs_build = force_rebuild or COLLECTION_NAME not in existing_collections
-
-        if not needs_build:
-            self.collection = self.chroma_client.get_collection(COLLECTION_NAME)
-            if self.collection.count() != len(self.catalog):
-                logger.warning(
-                    f"Collection has {self.collection.count()} docs but catalog "
-                    f"has {len(self.catalog)} — rebuilding"
-                )
-                needs_build = True
-
-        if needs_build:
-            if COLLECTION_NAME in existing_collections:
-                self.chroma_client.delete_collection(COLLECTION_NAME)
-            self.collection = self.chroma_client.create_collection(
-                name=COLLECTION_NAME,
-                metadata={"hnsw:space": "cosine"},  
-            )
-            self._index_all()
-        else:
-            logger.info(
-                f"Using existing ChromaDB collection ({self.collection.count()} docs)"
-            )
+        self.embeddings = self._get_catalog_embeddings()
 
         elapsed = time.perf_counter() - t0
         logger.info(f"SHLRetriever initialized in {elapsed:.2f}s")
 
-    def _index_all(self) -> None:
-        logger.info("Embedding and indexing all assessments into ChromaDB...")
-        t0 = time.perf_counter()
-        embeddings = self.model.encode(
-            self.chunks,
-            show_progress_bar=True,
-            batch_size=64,
-        ).tolist()
-        metadatas = []
-        for entry in self.catalog:
-            metadatas.append({
-                "name": entry["name"],
-                "url": entry["url"],
-                "test_type": entry.get("test_type") or "",
-                "test_type_name": entry.get("test_type_name") or "",
-                "job_levels": entry.get("job_levels") or "",
-                "description": (entry.get("description") or "")[:500],  
-                "assessment_length_minutes": str(entry.get("assessment_length_minutes") or ""),
-                "remote_testing": entry.get("remote_testing") or "",
-                "languages": entry.get("languages") or "",
-                "fact_sheet_url": entry.get("fact_sheet_url") or "",
-            })
+    def _get_hf_embeddings(self, texts: list[str]) -> np.ndarray:
+        client = InferenceClient(token=HF_TOKEN if HF_TOKEN else None)
+        
+        batch_size = 50
+        all_embeddings = []
+        
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i:i + batch_size]
+            
+            retries = 3
+            for attempt in range(retries):
+                try:
+                    # HuggingFace handles the request natively
+                    emb = client.feature_extraction(batch, model=HF_MODEL_ID)
+                    all_embeddings.extend(emb)
+                    break
+                except Exception as e:
+                    if attempt == retries - 1:
+                        raise
+                    logger.warning(f"HF API retry {attempt+1}/{retries} after error: {e}")
+                    time.sleep(10)
+                
+        return np.array(all_embeddings)
 
-        self.collection.add(
-            ids=self.ids,
-            embeddings=embeddings,
-            documents=self.chunks,
-            metadatas=metadatas,
-        )
-
-        elapsed = time.perf_counter() - t0
-        logger.info(f"Indexed {len(self.chunks)} assessments in {elapsed:.2f}s")
+    def _get_catalog_embeddings(self) -> np.ndarray:
+        cache_file = Path(__file__).parent / "embeddings_cache.npy"
+        
+        if cache_file.exists():
+            logger.info("Loading embeddings from local cache.")
+            return np.load(cache_file)
+            
+        logger.info("Calling HF API to embed catalog...")
+        embeddings = self._get_hf_embeddings(self.chunks)
+        
+        try:
+            np.save(cache_file, embeddings)
+            logger.info("Saved embeddings to local cache.")
+        except Exception as e:
+            logger.warning(f"Could not save embeddings cache: {e}")
+            
+        return embeddings
 
     def _dense_search(self, query: str, k: int) -> list[dict]:
-        query_embedding = self.model.encode(query).tolist()
+        try:
+            query_emb = self._get_hf_embeddings([query])[0]
+        except Exception as e:
+            logger.error(f"HF API failed for dense search: {e}")
+            return []
 
-        results = self.collection.query(
-            query_embeddings=[query_embedding],
-            n_results=k,
-            include=["documents", "metadatas", "distances"],
-        )
+        dot_products = np.dot(self.embeddings, query_emb)
+        norms = np.linalg.norm(self.embeddings, axis=1) * np.linalg.norm(query_emb)
+        norms[norms == 0] = 1e-10 
+        similarities = dot_products / norms
 
+        top_indices = np.argsort(similarities)[::-1][:k]
+        
         hits = []
-        for i in range(len(results["ids"][0])):
+        for rank, idx in enumerate(top_indices):
+            entry = self.catalog[idx]
             hits.append({
-                "id": results["ids"][0][i],
-                "rank": i + 1,
-                "distance": results["distances"][0][i],
-                "document": results["documents"][0][i],
-                "metadata": results["metadatas"][0][i],
+                "id": self.ids[idx],
+                "rank": rank + 1,
+                "distance": 1.0 - float(similarities[idx]),
+                "metadata": {
+                    "name": entry["name"],
+                    "url": entry["url"],
+                    "test_type": entry.get("test_type") or "",
+                    "test_type_name": entry.get("test_type_name") or "",
+                    "job_levels": entry.get("job_levels") or "",
+                    "description": (entry.get("description") or "")[:500],
+                    "assessment_length_minutes": str(entry.get("assessment_length_minutes") or ""),
+                    "remote_testing": entry.get("remote_testing") or "",
+                    "languages": entry.get("languages") or "",
+                    "fact_sheet_url": entry.get("fact_sheet_url") or "",
+                },
             })
         return hits
 
@@ -192,12 +173,7 @@ class SHLRetriever:
         return hits
 
     @staticmethod
-    def _rrf_fuse(
-        dense_hits: list[dict],
-        sparse_hits: list[dict],
-        k: int = DEFAULT_K,
-        rrf_k: int = RRF_K,
-    ) -> list[dict]:
+    def _rrf_fuse(dense_hits: list[dict], sparse_hits: list[dict], k: int = DEFAULT_K, rrf_k: int = RRF_K) -> list[dict]:
         fused: dict[str, dict] = {}
 
         for hit in dense_hits:
@@ -236,28 +212,18 @@ class SHLRetriever:
         ranked = sorted(fused.values(), key=lambda x: x["rrf_score"], reverse=True)
         return ranked[:k]
 
-    def retrieve(
-        self,
-        query: str,
-        k: int = DEFAULT_K,
-        dense_weight: float = 1.0,
-        sparse_weight: float = 1.0,
-    ) -> list[dict]:
-        
+    def retrieve(self, query: str, k: int = DEFAULT_K) -> list[dict]:
         t0 = time.perf_counter()
+        
         fetch_k = min(k * 3, len(self.catalog))
-
         dense_hits = self._dense_search(query, k=fetch_k)
         sparse_hits = self._sparse_search(query, k=fetch_k)
-
+        
         fused = self._rrf_fuse(dense_hits, sparse_hits, k=k)
 
         elapsed = time.perf_counter() - t0
-        logger.info(
-            f"Hybrid retrieval for '{query[:50]}...' → "
-            f"{len(fused)} results in {elapsed*1000:.1f}ms"
-        )
-
+        logger.info(f"Hybrid retrieval for '{query[:50]}...' → {len(fused)} results in {elapsed*1000:.1f}ms")
+        
         return fused
 
     def retrieve_clean(self, query: str, k: int = DEFAULT_K) -> list[dict]:
@@ -299,13 +265,7 @@ def main():
             print(f"\n  [{i+1}] {meta['name']}")
             print(f"      URL:        {meta['url']}")
             print(f"      Type:       {meta['test_type_name']}")
-            print(f"      Job Levels: {meta['job_levels']}")
-            print(f"      Duration:   {meta['assessment_length_minutes']} min")
-            print(f"      Remote:     {meta['remote_testing']}")
             print(f"      RRF Score:  {result['rrf_score']:.6f}")
-            print(f"      Dense Rank: {result['dense_rank']}")
-            print(f"      Sparse Rank: {result['sparse_rank']}")
-
 
 if __name__ == "__main__":
     main()
