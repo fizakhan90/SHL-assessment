@@ -212,10 +212,17 @@ class SHLRetriever:
         ranked = sorted(fused.values(), key=lambda x: x["rrf_score"], reverse=True)
         return ranked[:k]
 
-    def retrieve(self, query: str, k: int = DEFAULT_K) -> list[dict]:
+    def retrieve(self, query: str, k: int = DEFAULT_K, mode: str = "hybrid") -> list[dict]:
         t0 = time.perf_counter()
         
         fetch_k = min(k * 3, len(self.catalog))
+        
+        if mode == "bm25":
+            results = self._sparse_search(query, k=k)
+            elapsed = time.perf_counter() - t0
+            logger.info(f"BM25 retrieval for '{query[:50]}...' → {len(results)} results in {elapsed*1000:.1f}ms")
+            return results
+            
         dense_hits = self._dense_search(query, k=fetch_k)
         sparse_hits = self._sparse_search(query, k=fetch_k)
         
@@ -226,8 +233,8 @@ class SHLRetriever:
         
         return fused
 
-    def retrieve_clean(self, query: str, k: int = DEFAULT_K) -> list[dict]:
-        results = self.retrieve(query, k=k)
+    def retrieve_clean(self, query: str, k: int = DEFAULT_K, mode: str = "hybrid") -> list[dict]:
+        results = self.retrieve(query, k=k, mode=mode)
         clean_results = []
         for r in results:
             meta = r["metadata"]

@@ -28,11 +28,12 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from groq import Groq
+import google.generativeai as genai
 
 from retrieval import SHLRetriever
 
-
+from dotenv import load_dotenv
+load_dotenv()
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -40,11 +41,11 @@ logging.basicConfig(
 logger = logging.getLogger("agent")
 
 
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-GROQ_MODEL = "llama-3.3-70b-versatile"
-GROQ_TIMEOUT = 20  
-GROQ_MAX_TOKENS = 2048
-GROQ_TEMPERATURE = 0.1
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_MODEL = "gemini-1.5-flash"
+GEMINI_TIMEOUT = 15  
+GEMINI_MAX_TOKENS = 2048
+GEMINI_TEMPERATURE = 0.1
 
 SYSTEM_PROMPT_TEMPLATE = """You are the SHL Assessment Advisor, a specialist AI assistant that helps HR professionals and hiring managers find the right SHL assessments for their hiring needs.
 
@@ -91,6 +92,9 @@ If the user asks to compare assessments (e.g., "what is the difference between X
 
 ### Rule 5: REFUSE off-topic requests
 If the user asks about topics outside your scope, politely decline and redirect to assessment recommendations. Do not provide empty recommendations for off-topic requests — just explain your scope.
+When refusing, your reply must explicitly state you can only 
+help with SHL assessment selection. Do NOT ask a clarifying 
+question in response to an off-topic request.
 
 ## OUTPUT FORMAT
 You MUST respond with valid JSON only. No text before or after the JSON.
@@ -145,7 +149,7 @@ def build_system_prompt(catalog_results: list[dict]) -> str:
 
     return SYSTEM_PROMPT_TEMPLATE.format(catalog_context=catalog_context)
 
-def synthesize_search_query(messages: list[dict]) -> str:
+def synthesize_search_query(messages: list[dict], llm_client = None) -> str:
     user_messages = [m["content"] for m in messages if m["role"] == "user"]
 
     if not user_messages:
@@ -155,7 +159,83 @@ def synthesize_search_query(messages: list[dict]) -> str:
     if len(words) > 300:
         combined = " ".join(words[-300:])
 
+    if not llm_client:
+        return combined
+
+    system_prompt = (
+        "Extract the core search intent from the following user messages. "
+        "Extract job role, seniority, skills, test type preferences — ignore filler words. "
+        "Return ONLY the distilled keywords separated by spaces."
+    )
+
+    try:
+        logger.info(f"Attempting Gemini call with {len(messages)} messages")
+        response = llm_client.generate_content(
+            [system_prompt + "\n\n" + combined],
+            generation_config=genai.GenerationConfig(
+                temperature=0.0,
+                max_output_tokens=50,
+            ),
+            request_options={"timeout": 5.0}
+        )
+        distilled = response.text.strip()
+        if distilled:
+            return distilled
+    except Exception as e:
+        logger.warning(f"Query distillation failed/timed out, using fallback: {e}")
+        logger.error(f"LLM FAILED: {type(e).__name__}: {str(e)}")
+
     return combined
+
+
+def rerank_assessments(query: str, candidates: list[dict], llm_client = None) -> list[dict]:
+    if not llm_client or len(candidates) <= 10:
+        return candidates[:10]
+
+    system_prompt = (
+        "Given a search query and a list of candidate assessments, rerank them to find the top 10 most relevant. "
+        "Return ONLY a JSON list of strings containing the exact names of the top 10 assessments in ranked order."
+    )
+
+    candidates_text = ""
+    for c in candidates:
+        desc = (c.get("description") or "")[:100]
+        candidates_text += f"Name: {c['name']} | Type: {c.get('test_type_name', '')} | Level: {c.get('job_levels', '')} | Desc: {desc}\n"
+
+    user_content = f"Query: {query}\n\nCandidates:\n{candidates_text}"
+
+    try:
+        response = llm_client.generate_content(
+            [system_prompt + "\n\n" + user_content],
+            generation_config=genai.GenerationConfig(
+                temperature=0.0,
+                max_output_tokens=200,
+            ),
+            request_options={"timeout": 8.0}
+        )
+        
+        raw_response = response.text
+        match = re.search(r"\[.*\]", raw_response, re.DOTALL)
+        if match:
+            ranked_names = json.loads(match.group(0))
+            if isinstance(ranked_names, list):
+                name_to_candidate = {c["name"].lower(): c for c in candidates}
+                reranked = []
+                for name in ranked_names:
+                    if isinstance(name, str) and name.lower() in name_to_candidate:
+                        reranked.append(name_to_candidate[name.lower()])
+                        if len(reranked) == 10:
+                            break
+                for c in candidates:
+                    if len(reranked) == 10:
+                        break
+                    if c not in reranked:
+                        reranked.append(c)
+                return reranked[:10]
+    except Exception as e:
+        logger.warning(f"Reranking failed/timed out, using fallback: {e}")
+
+    return candidates[:10]
 
 def needs_clarification(messages: list[dict]) -> bool:
     user_messages = [m["content"] for m in messages if m["role"] == "user"]
@@ -183,6 +263,19 @@ def needs_clarification(messages: list[dict]) -> bool:
         if not any(indicator in query for indicator in specific_indicators):
             return True
 
+    # Explicit vague phrase check
+    explicit_vague = [
+        "can you help me",
+        "can you help",
+        "i need help",
+        "what can you do",
+        "what do you do",
+        "get started",
+        "where do i start",
+    ]
+    if any(phrase in query for phrase in explicit_vague):
+        return True
+
     vague_patterns = [
         r"^i need (?:an? )?(?:assessment|test|evaluation)s?\.?$",
         r"^(?:what|which) (?:tests?|assessments?) (?:do you have|are available|can you suggest)\??$",
@@ -191,6 +284,8 @@ def needs_clarification(messages: list[dict]) -> bool:
         r"^(?:hi|hello|hey)[\s!.,]*$",
         r"^(?:can you help|i need help)[\s?!.,]*$",
         r"^(?:what can you do|what do you do)\??$",
+        r"^(?:hello|hi|hey)[,\s]*can you help(?:\s+me)?\??$",
+        r"^can you help me\??$",
     ]
     for pattern in vague_patterns:
         if re.match(pattern, query):
@@ -266,8 +361,53 @@ def validate_recommendations(
 
 def build_fallback_response(
     catalog_results: list[dict],
+    messages: list[dict] = None,
     error_context: str = "",
 ) -> dict:
+    if messages is None:
+        messages = []
+        
+    last_user_msg = ""
+    user_msgs = [m.get("content", "") for m in messages if m.get("role") == "user"]
+    if user_msgs:
+        last_user_msg = user_msgs[-1].lower()
+
+    ending_signals = ["thank you", "thanks", "perfect", "great", 
+                      "that's all", "goodbye", "bye", "done",
+                      "that covers it", "that's what we need",
+                      "confirmed", "looks good"]
+
+    if any(signal in last_user_msg for signal in ending_signals):
+        return {
+            "reply": "You're welcome! Good luck with your hiring. Feel free to return if you need more assessment recommendations.",
+            "recommendations": [],
+            "end_of_conversation": True
+        }
+
+    off_topic_signals = [
+        "interview question", "capital of", "legally required",
+        "eeoc", "onboarding", "ignore previous", "system prompt",
+        "you are now", "2+2", "make a bomb"
+    ]
+    
+    if any(signal in last_user_msg for signal in off_topic_signals):
+        logger.info(f"Fallback triggered for off-topic query. Error context: {error_context}")
+        return {
+            "reply": "I can only help with SHL assessment selection. I'm not able to answer questions outside that scope.",
+            "recommendations": [],
+            "end_of_conversation": False
+        }
+
+    comparison_signals = ["difference between", "compare", "vs", "versus", "which is better"]
+    if any(signal in last_user_msg for signal in comparison_signals):
+        logger.info(f"Fallback triggered for comparison query. Error context: {error_context}")
+        return {
+            "reply": "I can compare those assessments for you, but I'm currently experiencing issues. Please try again.",
+            "recommendations": [],
+            "end_of_conversation": False
+        }
+
+    logger.info(f"Fallback triggered for general query. Error context: {error_context}")
     if catalog_results:
         recommendations = [
             {
@@ -330,23 +470,24 @@ app.add_middleware(
 )
 
 retriever: Optional[SHLRetriever] = None
-groq_client: Optional[Groq] = None
+llm_client = None
 
 
 @app.on_event("startup")
 async def startup():
-    global retriever, groq_client
+    global retriever, llm_client
 
     logger.info("Initializing SHL Retriever...")
     retriever = SHLRetriever()
     logger.info("SHL Retriever ready")
 
-    if GROQ_API_KEY:
-        groq_client = Groq(api_key=GROQ_API_KEY)
-        logger.info(f"Groq client initialized (model: {GROQ_MODEL})")
+    if GEMINI_API_KEY:
+        genai.configure(api_key=GEMINI_API_KEY)
+        llm_client = genai.GenerativeModel(GEMINI_MODEL)
+        logger.info(f"Gemini client initialized (model: {GEMINI_MODEL})")
     else:
         logger.warning(
-            "GROQ_API_KEY not set — LLM calls will be skipped, "
+            "GEMINI_API_KEY not set — LLM calls will be skipped, "
             "falling back to retrieval-only mode"
         )
 
@@ -375,53 +516,69 @@ async def chat(request: ChatRequest):
             catalog_results = []
         else:
             
-            search_query = synthesize_search_query(messages)
+            search_query = synthesize_search_query(messages, llm_client)
             logger.info(f"Synthesized search query: {search_query[:100]}...")
             try:
-                catalog_results = retriever.retrieve_clean(search_query, k=10)
-                logger.info(f"Retrieved {len(catalog_results)} assessments")
+                catalog_results = retriever.retrieve_clean(search_query, k=30)
+                logger.info(f"Retrieved {len(catalog_results)} candidate assessments")
+                catalog_results = rerank_assessments(search_query, catalog_results, llm_client)
+                logger.info(f"Reranked down to {len(catalog_results)} assessments")
             except Exception as e:
-                logger.error(f"Retrieval failed: {e}")
+                logger.error(f"Retrieval or reranking failed: {e}")
                 catalog_results = []
         system_prompt = build_system_prompt(catalog_results)
-        if not groq_client:
-            logger.warning("No Groq client — using fallback")
+        if not llm_client:
+            logger.warning("No Gemini client — using fallback")
             if should_clarify:
                 return ChatResponse(
                     reply="I'd love to help you find the right SHL assessment! Could you tell me what role you're hiring for, and what skills or competencies you'd like to assess?",
                     recommendations=[],
                     end_of_conversation=False,
                 )
-            result = build_fallback_response(catalog_results)
+            result = build_fallback_response(catalog_results, messages)
             return ChatResponse(**result)
 
         try:
-            t0 = time.perf_counter()
+            conversation_history = "\n\n".join([f"{m['role'].capitalize()}: {m['content']}" for m in messages])
+            llm_prompt = f"{system_prompt}\n\n{conversation_history}"
+            
+            max_retries = 1
+            base_delay = 1.0
+            
+            for attempt in range(max_retries + 1):
+                try:
+                    t0 = time.perf_counter()
 
-            llm_messages = [{"role": "system", "content": system_prompt}]
-            llm_messages.extend(messages)
+                    response = llm_client.generate_content(
+                        [llm_prompt],
+                        generation_config=genai.GenerationConfig(
+                            temperature=GEMINI_TEMPERATURE,
+                            max_output_tokens=GEMINI_MAX_TOKENS,
+                        ),
+                        request_options={"timeout": float(GEMINI_TIMEOUT)}
+                    )
 
-            completion = groq_client.chat.completions.create(
-                model=GROQ_MODEL,
-                messages=llm_messages,
-                temperature=GROQ_TEMPERATURE,
-                max_tokens=GROQ_MAX_TOKENS,
-                timeout=GROQ_TIMEOUT,
-            )
-
-            raw_response = completion.choices[0].message.content
-            elapsed = time.perf_counter() - t0
-            logger.info(f"LLM response in {elapsed:.2f}s ({len(raw_response)} chars)")
+                    raw_response = response.text
+                    elapsed = time.perf_counter() - t0
+                    logger.info(f"LLM response in {elapsed:.2f}s ({len(raw_response)} chars)")
+                    break
+                except Exception as e:
+                    if attempt < max_retries:
+                        delay = base_delay
+                        logger.warning(f"LLM call failed (attempt {attempt+1}): {e}. Retrying in {delay}s...")
+                        time.sleep(delay)
+                    else:
+                        raise e
 
         except Exception as e:
-            logger.error(f"LLM call failed: {e}")
+            logger.error(f"LLM call failed after retries: {e}")
             if should_clarify:
                 return ChatResponse(
                     reply="I'd love to help! Could you tell me more about the role you're hiring for?",
                     recommendations=[],
                     end_of_conversation=False,
                 )
-            result = build_fallback_response(catalog_results, str(e))
+            result = build_fallback_response(catalog_results, messages, str(e))
             return ChatResponse(**result)
         parsed = parse_llm_response(raw_response)
 
